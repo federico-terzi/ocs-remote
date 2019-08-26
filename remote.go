@@ -8,7 +8,6 @@ import (
 	"io/ioutil"
 	"io"
 	"os"
-	"strings"
 	"net/url"
 	"net/http"
 	"github.com/dustin/go-humanize"
@@ -16,12 +15,21 @@ import (
 	. "github.com/lxn/walk/declarative"
 )
 
+// TO COMPILE
+/*
+rsrc -manifest remote.manifest -o rsrc.syso -ico icon.ico
+go build
+.\ocs-remote.exe
+*/
+
 var mw *walk.MainWindow
 var addressTextEdit *walk.TextEdit
 var connectionStatusLabel *walk.Label
 var fileListBox *walk.ListBox
 var downloadProgressBar *walk.ProgressBar
 var downloadLabel *walk.Label
+var sequenceTextEdit *walk.TextEdit
+var downloadFolderTextEdit *walk.TextEdit
 
 var filesModel *EnvModel
 
@@ -128,34 +136,20 @@ func (wc *WriteCounter) Write(p []byte) (int, error) {
 	if wc.Count > 100 || wc.Total == wc.Size {
 		progress := int((float32(wc.Total) / float32(wc.Size))*100)
 		wc.Count = 0
-		fmt.Printf("%d\n", wc.Total)
 
 		mw.Synchronize(func() {
-			downloadLabel.SetText(fmt.Sprintf("Downloading %s: %s / %s", wc.Name, humanize.Bytes(wc.Total), humanize.Bytes(wc.Size)))
+			downloadLabel.SetText(fmt.Sprintf("Downloading %s: %s / %s, [ %d video remaining ]", wc.Name, humanize.Bytes(wc.Total), humanize.Bytes(wc.Size), len(downloadQueue)))
 			downloadProgressBar.SetValue(progress)
 		})
 	}
 	return n, nil
 }
 
-func (wc WriteCounter) PrintProgress() {
-	// Clear the line by using a character return to go back to the start and remove
-	// the remaining characters by filling it with spaces
-	fmt.Printf("\r%s", strings.Repeat(" ", 35))
-
-	// Return again and print current status of download
-	// We use the humanize package to print the bytes in a meaningful way (e.g. 10 MB)
-	fmt.Printf("\rDownloading... %d complete", wc.Total)
-}
-
-// DownloadFile will download a url to a local file. It's efficient because it will
-// write as it downloads and not load the whole file into memory. We pass an io.TeeReader
-// into Copy() to report progress on the download.
 func DownloadFile(filepath string, url string, size int64) error {
 
 	// Create the file, but give it a tmp file extension, this means we won't overwrite a
 	// file until it's downloaded, but we'll remove the tmp extension once downloaded.
-	out, err := os.Create(filepath)
+	out, err := os.Create(downloadFolderTextEdit.Text() + "\\" + filepath)
 	if err != nil {
 		return err
 	}
@@ -178,38 +172,97 @@ func DownloadFile(filepath string, url string, size int64) error {
 	return nil
 }
 
+func deleteVideo(name string) bool {
+	address := getAddress("delete?file="+url.QueryEscape(name))
+	resp, err := http.Get(address)
+	if err != nil {
+		log.Print("Error deleting the file")
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Print("Error deleting the file")
+		return false
+	}
+
+	if string(body) == "OK" {
+		return true
+	}
+
+	return false
+}
+
+func startRecording(name string) bool {
+	address := getAddress("start?name="+url.QueryEscape(name))
+	resp, err := http.Get(address)
+	if err != nil {
+		log.Print("Error starting the recording")
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Print("Error starting the recording")
+		return false
+	}
+
+	if string(body) == "OK" {
+		return true
+	}
+
+	return false
+}
+
+func stopRecording() bool {
+	address := getAddress("stop")
+	resp, err := http.Get(address)
+	if err != nil {
+		log.Print("Error stop the recording")
+		return false
+	}
+	defer resp.Body.Close()
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Print("Error stop the recording")
+		return false
+	}
+
+	if string(body) == "OK" {
+		return true
+	}
+
+	return false
+}
+
 func main() {
 	filesModel = NewEnvModel(nil)
 
 	_ = MainWindow{
 		Title:   "Open Camera Studio Remote",
-		MinSize: Size{600, 400},
+		Size: Size{600, 600},
 		Layout:  VBox{},
 		AssignTo: &mw,
 		Children: []Widget{
 			GroupBox{
 				Title:         "Phone",
 				Layout:        HBox{},
-				StretchFactor: 1,
+				StretchFactor: 0,
 				Children: []Widget{
-					HSplitter{
-						Children: []Widget{
-							TextEdit{
-								AssignTo: &addressTextEdit,
-								Text: "192.168.1.68:8000",
-							},
-							Label{
-								AssignTo: &connectionStatusLabel,
-								Text: "Status: Not connected",
-							},
-						},
+					TextEdit{
+						AssignTo: &addressTextEdit,
+						Text: "192.168.1.68:8000",
+						CompactHeight: true,
+					},
+					Label{
+						AssignTo: &connectionStatusLabel,
+						Text: "Status: Not connected",
 					},
 				},
 			},
 			GroupBox{
 				Title:         "Files",
 				Layout:        VBox{},
-				StretchFactor: 3,
 				Children: []Widget{
 					ListBox{
 						AssignTo: &fileListBox,
@@ -225,7 +278,15 @@ func main() {
 						MinValue:      0,
 						StretchFactor: 4,
 					},
-					HSplitter{
+					TextEdit{
+						AssignTo: &downloadFolderTextEdit,
+						Text: "D:\\Downloads",
+						CompactHeight: true,
+					},
+					GroupBox{
+						Title:         "Actions",
+						Layout:        HBox{},
+						StretchFactor: 0,
 						Children: []Widget{
 							PushButton{
 								Text: "Refresh",
@@ -248,17 +309,109 @@ func main() {
 							PushButton{
 								Text: "Download All",
 								OnClicked: func() {
+									for _, e := range filesModel.items {
+										downloadLink := fmt.Sprintf("%s%s", getAddress("download?file="), url.QueryEscape(e.name))
+										downloadQueue <- DownloadEntry{Url: downloadLink, Name: e.name, Size: e.size}
+									}
+								},
+							},
+							PushButton{
+								Text: "Delete Selected",
+								OnClicked: func() {
+									i := fileListBox.CurrentIndex()
+									if i < 0 {
+										return
+									}
+
+									res := walk.MsgBox(mw, "Delete Confirmation", "Are you sure to delete the selected video?", walk.MsgBoxYesNo)
+									if res == 6 {
+										deleteVideo(filesModel.items[i].name)
+									}
+
+									go updateFileList()
+								},
+							},
+							PushButton{
+								Text: "Delete All",
+								OnClicked: func() {
+									res := walk.MsgBox(mw, "Delete Confirmation", "Are you sure to delete all the videos?", walk.MsgBoxYesNo)
+									if res != 6 {
+										return
+									}
 									
+									res = walk.MsgBox(mw, "Delete Confirmation", "Are you REALLY sure to delete all the videos?", walk.MsgBoxYesNo)
+									if res != 6 {
+										return
+									}
+
+									for _, e := range filesModel.items {
+										deleteVideo(e.name)
+									}
+									
+									go updateFileList()
 								},
 							},
 						},
 					},
 				},
 			},
-			PushButton{
-				Text: "SCREAM",
-				OnClicked: func() {
-					
+			GroupBox{
+				Title:         "Recording",
+				Layout:        HBox{},
+				StretchFactor: 1,
+				Children: []Widget{
+					TextEdit{
+						AssignTo: &sequenceTextEdit,
+						Text: "sequence1",
+						Font: Font{
+							Family:    "Arial",
+							PointSize: 20,
+						},
+						CompactHeight: true,
+					},
+				},
+			},
+			GroupBox{
+				Title:         "Controls",
+				Layout:        HBox{},
+				StretchFactor: 2,
+				Children: []Widget{
+					PushButton{
+						Text: "Start",
+						Font: Font{
+							Family:    "Arial",
+							PointSize: 20,
+							Bold:      true,
+						},
+						OnClicked: func() {
+							startRecording(sequenceTextEdit.Text())
+						},
+					},
+					PushButton{
+						Text: "Retry",
+						Font: Font{
+							Family:    "Arial",
+							PointSize: 20,
+							Bold:      true,
+						},
+						OnClicked: func() {
+							stopRecording()
+							startRecording(sequenceTextEdit.Text())
+							go updateFileList()
+						},
+					},
+					PushButton{
+						Text: "Stop",
+						Font: Font{
+							Family:    "Arial",
+							PointSize: 20,
+							Bold:      true,
+						},
+						OnClicked: func() {
+							stopRecording()
+							go updateFileList()
+						},
+					},
 				},
 			},
 		},

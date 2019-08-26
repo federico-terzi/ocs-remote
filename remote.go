@@ -6,7 +6,12 @@ import (
 	"encoding/json"
 	"time"
 	"io/ioutil"
+	"io"
+	"os"
+	"strings"
+	"net/url"
 	"net/http"
+	"github.com/dustin/go-humanize"
 	"github.com/lxn/walk"
 	. "github.com/lxn/walk/declarative"
 )
@@ -20,8 +25,12 @@ var downloadLabel *walk.Label
 
 var filesModel *EnvModel
 
+func getAddress(path string) string {
+	return fmt.Sprintf("http://%s/%s", addressTextEdit.Text(), path)
+}
+
 func checkConnectionStatus() bool {
-	address := fmt.Sprintf("http://%s/checkocs", addressTextEdit.Text())
+	address := getAddress("checkocs")
 	resp, err := http.Get(address)
 	if err != nil {
 		log.Print("Error checking the address")
@@ -56,10 +65,15 @@ func connectionCheckDaemon() {
 	}
 }
 
-func getFiles() []string {
-	var output []string
+type ListedFile struct {
+	Name string `json:name`
+	Size int64  `json:size`
+}
 
-	address := fmt.Sprintf("http://%s/list", addressTextEdit.Text())
+func getFiles() []ListedFile {
+	var output []ListedFile
+
+	address := getAddress("list")
 	resp, err := http.Get(address)
 	if err != nil {
 		log.Print("Error getting the list")
@@ -80,8 +94,88 @@ func updateFileList() {
 	files := getFiles()
 
 	mw.Synchronize(func() {
-		fileListBox.SetModel(NewEnvModel(files))
+		filesModel = NewEnvModel(files)
+		fileListBox.SetModel(filesModel)
 	})
+}
+
+type DownloadEntry struct {
+	Url string
+	Name string
+	Size int64
+}
+var downloadQueue = make(chan DownloadEntry, 200)
+
+func downloadWorker() {
+	for {
+		download := <-downloadQueue
+		fmt.Println("Download "+download.Url)
+		DownloadFile(download.Name, download.Url, download.Size)
+	}
+}
+
+type WriteCounter struct {
+	Size uint64
+	Total uint64
+	Count int
+	Name string
+}
+
+func (wc *WriteCounter) Write(p []byte) (int, error) {
+	n := len(p)
+	wc.Total += uint64(n)
+	wc.Count++
+	if wc.Count > 100 || wc.Total == wc.Size {
+		progress := int((float32(wc.Total) / float32(wc.Size))*100)
+		wc.Count = 0
+		fmt.Printf("%d\n", wc.Total)
+
+		mw.Synchronize(func() {
+			downloadLabel.SetText(fmt.Sprintf("Downloading %s: %s / %s", wc.Name, humanize.Bytes(wc.Total), humanize.Bytes(wc.Size)))
+			downloadProgressBar.SetValue(progress)
+		})
+	}
+	return n, nil
+}
+
+func (wc WriteCounter) PrintProgress() {
+	// Clear the line by using a character return to go back to the start and remove
+	// the remaining characters by filling it with spaces
+	fmt.Printf("\r%s", strings.Repeat(" ", 35))
+
+	// Return again and print current status of download
+	// We use the humanize package to print the bytes in a meaningful way (e.g. 10 MB)
+	fmt.Printf("\rDownloading... %d complete", wc.Total)
+}
+
+// DownloadFile will download a url to a local file. It's efficient because it will
+// write as it downloads and not load the whole file into memory. We pass an io.TeeReader
+// into Copy() to report progress on the download.
+func DownloadFile(filepath string, url string, size int64) error {
+
+	// Create the file, but give it a tmp file extension, this means we won't overwrite a
+	// file until it's downloaded, but we'll remove the tmp extension once downloaded.
+	out, err := os.Create(filepath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	// Get the data
+	resp, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Create our progress reporter and pass it to be used alongside our writer
+	counter := &WriteCounter{Size: uint64(size), Name: filepath}
+	_, err = io.Copy(out, io.TeeReader(resp.Body, counter))
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func main() {
@@ -142,7 +236,13 @@ func main() {
 							PushButton{
 								Text: "Download Selected",
 								OnClicked: func() {
-									
+									i := fileListBox.CurrentIndex()
+									if i < 0 {
+										return
+									}
+
+									downloadLink := fmt.Sprintf("%s%s", getAddress("download?file="), url.QueryEscape(filesModel.items[i].name))
+									downloadQueue <- DownloadEntry{Url: downloadLink, Name: filesModel.items[i].name, Size: filesModel.items[i].size}
 								},
 							},
 							PushButton{
@@ -165,12 +265,14 @@ func main() {
 	}.Create()
 
 	go connectionCheckDaemon()
+	go downloadWorker()
 
 	mw.Run()
 }
 
 type EnvItem struct {
 	name  string
+	size  int64
 }
 
 type EnvModel struct {
@@ -178,11 +280,11 @@ type EnvModel struct {
 	items []EnvItem
 }
 
-func NewEnvModel(items []string) *EnvModel {
+func NewEnvModel(items []ListedFile) *EnvModel {
 	m := &EnvModel{items: make([]EnvItem, len(items))}
 
 	for i, e := range items {
-		m.items[i] = EnvItem{e}
+		m.items[i] = EnvItem{e.Name, e.Size}
 	}
 
 	return m
@@ -193,5 +295,5 @@ func (m *EnvModel) ItemCount() int {
 }
 
 func (m *EnvModel) Value(index int) interface{} {
-	return m.items[index].name
+	return fmt.Sprintf("%s [ %s ]", m.items[index].name, humanize.Bytes(uint64(m.items[index].size)))
 }
